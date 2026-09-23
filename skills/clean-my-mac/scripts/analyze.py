@@ -7,6 +7,7 @@ Produces a JSON report of cache directories and their sizes.
 import json
 import os
 import subprocess
+import urllib.parse
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional
@@ -40,7 +41,7 @@ def get_dir_size(path: str) -> int:
             ['du', '-sk', path],
             capture_output=True,
             text=True,
-            timeout=30
+            timeout=300
         )
         if result.returncode == 0:
             # du -sk outputs "size_in_kb\tpath"
@@ -106,6 +107,162 @@ def get_docker_disk_usage() -> dict:
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
     return {}
+
+
+# Applications that reuse the VS Code / Electron user-data layout.
+# (label, user-data directory name under ~/Library/Application Support, .app bundle name)
+VSCODE_APPS = [
+    ('VS Code', 'Code', 'Visual Studio Code'),
+    ('VS Code Insiders', 'Code - Insiders', 'Visual Studio Code - Insiders'),
+    ('Cursor', 'Cursor', 'Cursor'),
+    ('VSCodium', 'VSCodium', 'VSCodium'),
+    ('Windsurf', 'Windsurf', 'Windsurf'),
+]
+
+# Cache groups shared by all VS Code-like apps: (category_id, name, relative path, note)
+VSCODE_CACHE_GROUPS = [
+    (
+        'vscode-webview-cache',
+        'VS Code Webview Resource Cache',
+        Path('Service Worker') / 'CacheStorage',
+        'Ephemeral webview/resource cache - rebuilt on demand. Usually the single '
+        'biggest reclaimable item, and it never expires on its own.',
+    ),
+    (
+        'vscode-webstorage',
+        'VS Code WebStorage',
+        Path('WebStorage'),
+        'Per-webview CacheStorage + IndexedDB. Safe to drop.',
+    ),
+    (
+        'vscode-http-cache',
+        'VS Code HTTP Cache',
+        Path('Cache'),
+        'Chromium disk HTTP cache.',
+    ),
+    (
+        'vscode-vsix-cache',
+        'VS Code Extension VSIX Cache',
+        Path('CachedExtensionVSIXs'),
+        'Downloaded .vsix installers kept after install. Installed extensions '
+        'are unaffected - these are never reused.',
+    ),
+]
+
+
+def vscode_app_dirs() -> list:
+    """Return [(label, app_bundle_name, user_data_dir)] for installed VS Code-like apps."""
+    base = Path.home() / 'Library' / 'Application Support'
+    found = []
+    for label, dirname, app_name in VSCODE_APPS:
+        d = base / dirname
+        if d.is_dir():
+            found.append((label, app_name, d))
+    return found
+
+
+def is_app_running(app_name: str) -> bool:
+    """True if the given .app bundle has a live process."""
+    try:
+        result = subprocess.run(
+            ['pgrep', '-f', f'{app_name}.app/Contents/MacOS'],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return result.returncode == 0 and result.stdout.strip() != ''
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+def scan_stale_workspaces(user_dir: Path):
+    """Find workspaceStorage entries whose project folder no longer exists.
+
+    Returns (stale_bytes, stale_count, total_count).
+    Entries pointing at /Volumes are kept - the drive may simply be unmounted.
+    """
+    ws = user_dir / 'workspaceStorage'
+    if not ws.is_dir():
+        return 0, 0, 0
+
+    stale_bytes = stale_count = total_count = 0
+    for d in ws.iterdir():
+        if not d.is_dir():
+            continue
+        total_count += 1
+
+        manifest = d / 'workspace.json'
+        if not manifest.exists():
+            continue
+        try:
+            folder = json.loads(manifest.read_text()).get('folder', '').replace('file://', '')
+            folder = urllib.parse.unquote(folder)
+        except Exception:
+            continue
+
+        if not folder or os.path.exists(folder) or folder.startswith('/Volumes/'):
+            continue
+
+        stale_bytes += get_dir_size(str(d))
+        stale_count += 1
+
+    return stale_bytes, stale_count, total_count
+
+
+def analyze_vscode_apps() -> list[CacheEntry]:
+    """Analyse VS Code-family Electron user-data dirs."""
+    entries: list[CacheEntry] = []
+    apps = vscode_app_dirs()
+    if not apps:
+        return entries
+
+    running = [label for label, app_name, _ in apps if is_app_running(app_name)]
+    warning = f' | ⚠ {running[0]} is RUNNING - close it first' if running else ''
+
+    for cat_id, name, rel, note in VSCODE_CACHE_GROUPS:
+        paths, size, count = [], 0, 0
+        for _label, _app_name, root in apps:
+            p = root / rel
+            if p.exists():
+                paths.append(p)
+                size += get_dir_size(str(p))
+                count += get_file_count(str(p))
+        if size <= 0:
+            continue
+        entries.append(CacheEntry(
+            category_id=cat_id,
+            name=name,
+            path=', '.join(str(p) for p in paths),
+            exists=True,
+            size_bytes=size,
+            size_human=human_size(size),
+            count=count,
+            notes=note + warning,
+        ))
+
+    stale_bytes = stale_count = total_count = 0
+    for _label, _app_name, root in apps:
+        b, s, t = scan_stale_workspaces(root / 'User')
+        stale_bytes += b
+        stale_count += s
+        total_count += t
+
+    if stale_count:
+        entries.append(CacheEntry(
+            category_id='vscode-stale-workspaces',
+            name='VS Code Stale Workspace State',
+            path=', '.join(str(root / 'User' / 'workspaceStorage') for _l, _a, root in apps),
+            exists=True,
+            size_bytes=stale_bytes,
+            size_human=human_size(stale_bytes),
+            count=stale_count,
+            notes=(
+                f'{stale_count} of {total_count} workspaces point at folders that no '
+                'longer exist. Live workspaces and entries on unmounted /Volumes are kept.'
+            ) + warning,
+        ))
+
+    return entries
 
 
 def analyze() -> list[CacheEntry]:
@@ -256,6 +413,9 @@ def analyze() -> list[CacheEntry]:
             size_human=human_size(get_dir_size(str(xcode_archives)))
         ))
     
+    # === VS Code family (Code, Insiders, Cursor, VSCodium, Windsurf) ===
+    entries.extend(analyze_vscode_apps())
+
     return entries
 
 

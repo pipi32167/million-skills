@@ -17,6 +17,22 @@
 | Homebrew Cache | ~/Library/Caches/Homebrew |
 | Xcode DerivedData | ~/Library/Developer/Xcode/DerivedData |
 | Xcode Archives | ~/Library/Developer/Xcode/Archives |
+| VS Code Webview Cache | `<userData>/Service Worker/CacheStorage` |
+| VS Code WebStorage | `<userData>/WebStorage` |
+| VS Code HTTP Cache | `<userData>/Cache` |
+| VS Code VSIX Cache | `<userData>/CachedExtensionVSIXs` |
+| VS Code Stale Workspaces | stale entries in `<userData>/User/workspaceStorage` |
+| VS Code Orphaned History | stale entries in `<userData>/User/History` *(opt-in)* |
+
+### VS Code family
+
+Applies to **VS Code**, **VS Code Insiders**, **Cursor**, **VSCodium** and
+**Windsurf**, detected automatically. `<userData>` is
+`~/Library/Application Support/<app>`.
+
+The webview resource cache (`Service Worker/CacheStorage`) is the item to look at
+first. It is never expired automatically, so it can quietly reach tens of GB —
+one real machine had **20 GB / 121k files** sitting there untouched since 2024.
 
 ## Installation
 
@@ -45,5 +61,9 @@ The skill will:
 
 - Always shows analysis before deleting
 - Requires user confirmation
+- `--dry-run` reports what would be cleaned without touching anything
 - Never removes running containers
+- Never touches a running VS Code-family editor (skipped and reported)
+- Never prunes entries under `/Volumes/*` (drive may just be unmounted)
 - Preserves latest Gradle versions
+- Local edit history is opt-in only — never part of `all`
